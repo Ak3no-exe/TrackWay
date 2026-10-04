@@ -1,0 +1,3 @@
+<resources>
+    <style name="Theme.TrackWay" parent="android:Theme.Material.NoActionBar" />
+</resources>
