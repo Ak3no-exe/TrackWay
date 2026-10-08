@@ -36,10 +36,12 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.osmdroid.config.Configuration
+import org.osmdroid.tileprovider.cachemanager.CacheManager
 import org.osmdroid.tileprovider.modules.SqlTileWriter
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
 import org.osmdroid.util.GeoPoint
@@ -50,9 +52,9 @@ import org.osmdroid.views.overlay.mylocation.MyLocationNewOverlay
 import java.util.Calendar
 
 val MODES = listOf("🚗 Voiture", "🚆 Train", "✈️ Avion", "🚶 Marche", "🚲 Vélo", "🏍️ Moto",
-    "🚌 Bus", "🚇 Métro", "🛴 Trottinette", "⛵ Bateau", "➕ Autre")
+    "🚌 Bus", "🚇 Métro", "🛴 Trottinette", "⛵ Bateau", "🏃 Course", "➕ Autre")
 val COLORS = listOf(0xFF2196F3, 0xFF9C27B0, 0xFFFF9800, 0xFF4CAF50, 0xFF00BCD4, 0xFFF44336,
-    0xFFFFC107, 0xFF3F51B5, 0xFF8BC34A, 0xFF009688, 0xFF795548)
+    0xFFFFC107, 0xFF3F51B5, 0xFF8BC34A, 0xFF009688, 0xFFE91E63, 0xFF795548)
 val ACCENTS = listOf(0xFF2196F3, 0xFF4CAF50, 0xFFF44336, 0xFFFF9800, 0xFF9C27B0, 0xFF009688)
 
 fun hasLoc(c: Context) = ContextCompat.checkSelfPermission(c, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
@@ -87,6 +89,16 @@ class MainActivity : ComponentActivity() {
             userAgentValue = packageName
         }
         setContent { App() }
+        handleStrava(intent)
+    }
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleStrava(intent)
+    }
+    private fun handleStrava(i: Intent?) {
+        val d = i?.data ?: return
+        if (d.scheme == "trackway" && d.host == "strava")
+            CoroutineScope(Dispatchers.IO).launch { stravaHandleRedirect(applicationContext, d) }
     }
 }
 
@@ -122,6 +134,13 @@ fun App() {
     // (Re)lance le service si un trajet est en cours : démarrage et reprise après fermeture brutale
     LaunchedEffect(active?.id, perm) {
         if (active != null && perm) ctx.startForegroundService(Intent(ctx, TrackingService::class.java))
+    }
+    // Synchro Strava automatique à l'ouverture de l'app
+    LaunchedEffect(Unit) {
+        if (stravaConnected(ctx)) try {
+            val n = stravaSync(ctx, dao)
+            if (n > 0) toast(ctx, "$n trajet(s) Strava importé(s)")
+        } catch (e: Exception) { }
     }
     // Résumé affiché à la fin d'un trajet
     LaunchedEffect(trips) {
@@ -199,7 +218,7 @@ fun App() {
             )
             Scaffold(bottomBar = {
                 NavigationBar {
-                    listOf("🗺️" to "Carte", "📋" to "Trajets", "📊" to "Stats", "🎵" to "Musique", "👤" to "Profil").forEachIndexed { i, (e, l) ->
+                    listOf("🗺️" to "Carte", "📋" to "Trajets", "📊" to "Stats", "🟠" to "Strava", "👤" to "Profil").forEachIndexed { i, (e, l) ->
                         NavigationBarItem(selected = tab == i, onClick = { tab = i }, icon = { Text(e) }, label = { Text(l, maxLines = 1) })
                     }
                 }
@@ -215,7 +234,7 @@ fun App() {
                             onRename = { t, n -> scope.launch(Dispatchers.IO) { dao.updateTrip(t.copy(name = n)) } },
                             onDelete = { t -> scope.launch(Dispatchers.IO) { dao.delPts(t.id); dao.delTrip(t.id) } })
                         2 -> StatsTab(trips, miles)
-                        3 -> MusicTab()
+                        3 -> StravaTab(dao)
                         else -> ProfileTab(theme, accent, miles,
                             setTheme = { theme = it; sp.edit().putInt("theme", it).apply() },
                             setAccent = { accent = it; sp.edit().putInt("accent", it).apply() },
@@ -236,7 +255,6 @@ fun MapTab(active: Trip?, selected: Trip?, dao: TripDao, perm: Boolean, miles: B
     val ctx = LocalContext.current
     val shown = active ?: selected
     var msg by remember { mutableStateOf("") }
-    val scope = rememberCoroutineScope()
     val map = remember {
         MapView(ctx).apply {
             setTileSource(TileSourceFactory.MAPNIK)
@@ -282,17 +300,14 @@ fun MapTab(active: Trip?, selected: Trip?, dao: TripDao, perm: Boolean, miles: B
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(onClick = { me.enableFollowLocation() }, modifier = Modifier.weight(1f)) { Text("Recentrer") }
                 OutlinedButton(onClick = {
-                    val bb = map.boundingBox
                     val z = map.zoomLevelDouble.toInt()
-                    var zm = minOf(z + 2, 17)
-                    while (zm > z && countTiles(bb, z, zm) > 1000) zm--
-                    if (countTiles(bb, z, zm) > 1000) msg = "Zone trop grande : zoome davantage"
-                    else scope.launch(Dispatchers.IO) {
-                        try {
-                            val (ok, ko) = downloadArea(bb, z, zm, ctx.packageName) { d, t -> msg = "Téléchargement $d/$t" }
-                            msg = if (ko == 0) "Zone téléchargée ($ok tuiles)" else "Terminé : $ok ok, $ko échecs (Internet ?)"
-                        } catch (e: Throwable) { msg = "Erreur : ${e.message}" }
-                    }
+                    CacheManager(map).downloadAreaAsync(ctx, map.boundingBox, z, minOf(z + 3, 17), object : CacheManager.CacheManagerCallback {
+                        override fun onTaskComplete() { msg = "Zone téléchargée" }
+                        override fun onTaskFailed(errors: Int) { msg = "Échec du téléchargement ($errors erreurs)" }
+                        override fun updateProgress(progress: Int, currentZoomLevel: Int, zoomMin: Int, zoomMax: Int) { msg = "Téléchargement… $progress" }
+                        override fun downloadStarted() { msg = "Téléchargement…" }
+                        override fun setPossibleTilesInArea(total: Int) {}
+                    })
                 }, modifier = Modifier.weight(1f)) { Text("Télécharger la zone", maxLines = 1) }
             }
             Spacer(Modifier.height(8.dp))
@@ -349,115 +364,4 @@ fun HistoryTab(trips: List<Trip>, dao: TripDao, miles: Boolean, onShow: (Trip) -
             OutlinedButton(onClick = { mf = if (mf >= MODES.size - 1) -1 else mf + 1 }, modifier = Modifier.weight(1f), contentPadding = PaddingValues(4.dp)) {
                 Text("Filtre : " + if (mf < 0) "Tous" else MODES[mf], maxLines = 1)
             }
-            OutlinedButton(onClick = { sort = (sort + 1) % 3 }, modifier = Modifier.weight(1f), contentPadding = PaddingValues(4.dp)) {
-                Text("Tri : " + listOf("Date", "Distance", "Durée")[sort], maxLines = 1)
-            }
-        }
-        if (list.isEmpty()) Box(Modifier.fillMaxSize(), Alignment.Center) { Text("Aucun trajet") }
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(list, key = { it.id }) { t ->
-                Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(12.dp)) {
-                    Text(t.mode + " · " + t.name, style = MaterialTheme.typography.titleMedium)
-                    Text(hm(t.startMs))
-                    Thumb(dao, t)
-                    Text("%.2f %s · %s".format(cv(t.distance / 1000, miles), dU(miles), dur(tripMs(t))))
-                    Text("moy %.1f · max %.0f %s".format(cv(avg(t), miles), cv(t.maxSpeed, miles), sU(miles)))
-                    Row(Modifier.fillMaxWidth()) {
-                        TextButton(onClick = { onShow(t) }, Modifier.weight(1f), contentPadding = PaddingValues(2.dp)) { Text("Voir") }
-                        TextButton(onClick = { nn = t.name; ren = t }, Modifier.weight(1f), enabled = t.endMs != null, contentPadding = PaddingValues(2.dp)) { Text("Renommer", maxLines = 1) }
-                        TextButton(onClick = { onDelete(t) }, Modifier.weight(1f), enabled = t.endMs != null, contentPadding = PaddingValues(2.dp)) { Text("Supprimer", maxLines = 1) }
-                    }
-                    Row(Modifier.fillMaxWidth()) {
-                        listOf("gpx", "json", "csv").forEach { f ->
-                            TextButton(onClick = { onExport(t, f) }, Modifier.weight(1f), enabled = t.endMs != null, contentPadding = PaddingValues(2.dp)) { Text(f.uppercase()) }
-                        }
-                    }
-                } }
-            }
-        }
-    }
-}
-
-@Composable
-fun BarChart(title: String, items: List<Pair<String, Double>>, fmt: (Double) -> String) {
-    Text(title, style = MaterialTheme.typography.titleMedium)
-    if (items.isEmpty()) { Text("Pas de données"); return }
-    val mx = items.maxOf { it.second }.coerceAtLeast(1e-9)
-    Row(Modifier.fillMaxWidth().height(130.dp), verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-        items.forEach { (l, v) ->
-            Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Bottom) {
-                Text(fmt(v), style = MaterialTheme.typography.labelSmall, maxLines = 1)
-                Box(Modifier.fillMaxWidth().height((80 * (v / mx)).dp.coerceAtLeast(2.dp)).background(MaterialTheme.colorScheme.primary, RoundedCornerShape(4.dp)))
-                Text(l)
-            }
-        }
-    }
-}
-
-@Composable
-fun StatsTab(trips: List<Trip>, miles: Boolean) {
-    var p by remember { mutableIntStateOf(4) }
-    val from = since(p)
-    val done = trips.filter { it.endMs != null && it.startMs >= from }
-    val km = done.sumOf { it.distance } / 1000
-    val ms = done.sumOf { tripMs(it) }
-    val h = ms / 3.6e6
-    val byMode = done.groupBy { it.mode.substringBefore(" ") }
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("Statistiques", style = MaterialTheme.typography.headlineSmall)
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-            listOf("Jour", "Semaine", "Mois", "Année", "Tout").forEachIndexed { i, l ->
-                if (p == i) Button(onClick = { p = i }, Modifier.weight(1f), contentPadding = PaddingValues(0.dp)) { Text(l, maxLines = 1, style = MaterialTheme.typography.labelSmall) }
-                else OutlinedButton(onClick = { p = i }, Modifier.weight(1f), contentPadding = PaddingValues(0.dp)) { Text(l, maxLines = 1, style = MaterialTheme.typography.labelSmall) }
-            }
-        }
-        Text("%.1f %s".format(cv(km, miles), dU(miles)), style = MaterialTheme.typography.displayMedium)
-        Text("Trajets : ${done.size} · Temps total : ${dur(ms)}")
-        Text("Vitesse moyenne : %.1f %s · max : %.0f %s".format(
-            cv(if (h > 0) km / h else 0.0, miles), sU(miles), cv(done.maxOfOrNull { it.maxSpeed } ?: 0.0, miles), sU(miles)))
-        Spacer(Modifier.height(8.dp))
-        BarChart("Distance par transport (${dU(miles)})", byMode.map { (m, l) -> m to cv(l.sumOf { it.distance } / 1000, miles) }) { "%.0f".format(it) }
-        Spacer(Modifier.height(8.dp))
-        BarChart("Temps par transport (min)", byMode.map { (m, l) -> m to l.sumOf { tripMs(it) } / 60000.0 }) { "%.0f".format(it) }
-    }
-}
-
-@Composable
-fun ProfileTab(theme: Int, accent: Int, miles: Boolean, setTheme: (Int) -> Unit, setAccent: (Int) -> Unit, setMiles: (Boolean) -> Unit,
-               onExport: (String) -> Unit, onImport: () -> Unit, onDeleteAll: () -> Unit, onClearMaps: () -> Unit) {
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Text("Profil & paramètres", style = MaterialTheme.typography.headlineSmall)
-        Text("Thème", style = MaterialTheme.typography.titleMedium)
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            listOf("Auto", "Clair", "Sombre").forEachIndexed { i, l ->
-                if (theme == i) Button(onClick = { setTheme(i) }, Modifier.weight(1f)) { Text(l) }
-                else OutlinedButton(onClick = { setTheme(i) }, Modifier.weight(1f)) { Text(l) }
-            }
-        }
-        Text("Couleur principale", style = MaterialTheme.typography.titleMedium)
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            ACCENTS.forEachIndexed { i, c ->
-                Box(Modifier.size(44.dp).background(Color(c), CircleShape)
-                    .then(if (accent == i) Modifier.border(3.dp, MaterialTheme.colorScheme.onSurface, CircleShape) else Modifier)
-                    .clickable { setAccent(i) })
-            }
-        }
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Miles / mph (sinon km / km/h)", Modifier.weight(1f))
-            Switch(checked = miles, onCheckedChange = setMiles)
-        }
-        HorizontalDivider()
-        Text("Export des trajets terminés", style = MaterialTheme.typography.titleMedium)
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            listOf("gpx", "json", "csv").forEach { f -> OutlinedButton(onClick = { onExport(f) }, Modifier.weight(1f)) { Text(f.uppercase()) } }
-        }
-        Button(onClick = onImport, Modifier.fillMaxWidth()) { Text("Importer un fichier GPX / JSON / CSV") }
-        HorizontalDivider()
-        Text("Données et cartes", style = MaterialTheme.typography.titleMedium)
-        OutlinedButton(onClick = onClearMaps, Modifier.fillMaxWidth()) { Text("Vider les cartes hors ligne") }
-        Button(onClick = onDeleteAll, Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) { Text("Supprimer mes trajets") }
-        HorizontalDivider()
-        Text("TrackWay 1.0", style = MaterialTheme.typography.titleMedium)
-        Text("Toutes les données (trajets, points GPS, cartes) restent sur cet appareil. Aucun serveur n'est utilisé, sauf pour télécharger les tuiles de carte.")
-    }
-}
+            OutlinedButton(onClick = { sort = (sort + 1) % 3 }, modifier = Modifier.weight(1f), content2
