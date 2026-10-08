@@ -36,7 +36,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -89,16 +88,6 @@ class MainActivity : ComponentActivity() {
             userAgentValue = packageName
         }
         setContent { App() }
-        handleStrava(intent)
-    }
-    override fun onNewIntent(intent: Intent) {
-        super.onNewIntent(intent)
-        handleStrava(intent)
-    }
-    private fun handleStrava(i: Intent?) {
-        val d = i?.data ?: return
-        if (d.scheme == "trackway" && d.host == "strava")
-            CoroutineScope(Dispatchers.IO).launch { stravaHandleRedirect(applicationContext, d) }
     }
 }
 
@@ -134,13 +123,6 @@ fun App() {
     // (Re)lance le service si un trajet est en cours : démarrage et reprise après fermeture brutale
     LaunchedEffect(active?.id, perm) {
         if (active != null && perm) ctx.startForegroundService(Intent(ctx, TrackingService::class.java))
-    }
-    // Synchro Strava automatique à l'ouverture de l'app
-    LaunchedEffect(Unit) {
-        if (stravaConnected(ctx)) try {
-            val n = stravaSync(ctx, dao)
-            if (n > 0) toast(ctx, "$n trajet(s) Strava importé(s)")
-        } catch (e: Exception) { }
     }
     // Résumé affiché à la fin d'un trajet
     LaunchedEffect(trips) {
@@ -218,7 +200,7 @@ fun App() {
             )
             Scaffold(bottomBar = {
                 NavigationBar {
-                    listOf("🗺️" to "Carte", "📋" to "Trajets", "📊" to "Stats", "🟠" to "Strava", "👤" to "Profil").forEachIndexed { i, (e, l) ->
+                    listOf("🗺️" to "Carte", "📋" to "Trajets", "📊" to "Stats", "👤" to "Profil").forEachIndexed { i, (e, l) ->
                         NavigationBarItem(selected = tab == i, onClick = { tab = i }, icon = { Text(e) }, label = { Text(l, maxLines = 1) })
                     }
                 }
@@ -234,7 +216,6 @@ fun App() {
                             onRename = { t, n -> scope.launch(Dispatchers.IO) { dao.updateTrip(t.copy(name = n)) } },
                             onDelete = { t -> scope.launch(Dispatchers.IO) { dao.delPts(t.id); dao.delTrip(t.id) } })
                         2 -> StatsTab(trips, miles)
-                        3 -> StravaTab(dao)
                         else -> ProfileTab(theme, accent, miles,
                             setTheme = { theme = it; sp.edit().putInt("theme", it).apply() },
                             setAccent = { accent = it; sp.edit().putInt("accent", it).apply() },
@@ -364,4 +345,16 @@ fun HistoryTab(trips: List<Trip>, dao: TripDao, miles: Boolean, onShow: (Trip) -
             OutlinedButton(onClick = { mf = if (mf >= MODES.size - 1) -1 else mf + 1 }, modifier = Modifier.weight(1f), contentPadding = PaddingValues(4.dp)) {
                 Text("Filtre : " + if (mf < 0) "Tous" else MODES[mf], maxLines = 1)
             }
-            OutlinedButton(onClick = { sort = (sort + 1) % 3 }, modifier = Modifier.weight(1f), content2
+            OutlinedButton(onClick = { sort = (sort + 1) % 3 }, modifier = Modifier.weight(1f), contentPadding = PaddingValues(4.dp)) {
+                Text("Tri : " + listOf("Date", "Distance", "Durée")[sort], maxLines = 1)
+            }
+        }
+        if (list.isEmpty()) Box(Modifier.fillMaxSize(), Alignment.Center) { Text("Aucun trajet") }
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            items(list, key = { it.id }) { t ->
+                Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(12.dp)) {
+                    Text(t.mode + " · " + t.name, style = MaterialTheme.typography.titleMedium)
+                    Text(hm(t.startMs))
+                    Thumb(dao, t)
+                    Text("%.2f %s · %s".format(cv(t.distance / 1000, miles), dU(miles), dur(tripMs(t))))
+                    Text("moy %.1f · max
