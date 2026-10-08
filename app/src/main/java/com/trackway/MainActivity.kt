@@ -357,4 +357,4 @@ fun HistoryTab(trips: List<Trip>, dao: TripDao, miles: Boolean, onShow: (Trip) -
                     Text(hm(t.startMs))
                     Thumb(dao, t)
                     Text("%.2f %s · %s".format(cv(t.distance / 1000, miles), dU(miles), dur(tripMs(t))))
-                    Text("moy %.1f · max
+                    Text("moy %.1f · max %.0f %s".format(cv(avg(t), miles), cv(t.maxSpeed, miles), sU(miles)))
