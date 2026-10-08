@@ -41,7 +41,7 @@ fun stravaLogout(c: Context) { sp(c).edit().clear().apply(); bump() }
 /** Ouvre la page d'autorisation Strava (app Strava si installée, sinon navigateur). */
 fun stravaLogin(c: Context) {
     val uri = Uri.parse("https://www.strava.com/oauth/mobile/authorize").buildUpon()
-        .appendQueryParameter("client_id", sp(c).getString("cid", ""))
+        .appendQueryParameter("client_id", sp(c).getString("cid", "") ?: "")
         .appendQueryParameter("redirect_uri", STRAVA_REDIRECT)
         .appendQueryParameter("response_type", "code")
         .appendQueryParameter("approval_prompt", "auto")
